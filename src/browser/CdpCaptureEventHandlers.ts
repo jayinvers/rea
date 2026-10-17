@@ -31,6 +31,7 @@ import type { CdpCaptureEventsState } from "./CdpCaptureEventState.js";
 import {
   CDP_CAPTURE_SCRIPT_METADATA_LIMITS,
   type CapturedScript,
+  type CdpNetworkEventSource,
   type NetworkState,
 } from "./CdpCaptureEventTypes.js";
 
@@ -211,6 +212,7 @@ const sourceMapForScript = (
 export const handleRequestWillBeSent = (
   state: CdpCaptureEventsState,
   params: UnknownRecord,
+  source?: CdpNetworkEventSource,
 ): void => {
   const requestId = cdpStringValue(params.requestId);
   const request = recordValue(params.request);
@@ -332,6 +334,7 @@ export const handleRequestWillBeSent = (
       line: integerOrNull(initiatorFrame?.lineNumber),
       column: integerOrNull(initiatorFrame?.columnNumber),
     },
+    worker_target_id: source?.worker_target_id ?? null,
     body_shapes: requestBodyShape(state, request),
   });
   const timestamp = numberValue(params.timestamp);

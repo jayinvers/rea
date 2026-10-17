@@ -2,6 +2,34 @@ import type { WebSocket } from "ws";
 
 import type { FakeCdpCommand, FakeOptions } from "./fakeCdpBrowserTypes.js";
 
+/** Flattened session and target identity of the fake dedicated worker. */
+export const DEDICATED_WORKER_SESSION_ID = "worker-session-1";
+export const DEDICATED_WORKER_TARGET_ID = "worker-attached-1";
+/** Flattened session and target identity of the worker it starts. */
+export const NESTED_WORKER_SESSION_ID = "worker-session-2";
+export const NESTED_WORKER_TARGET_ID = "worker-attached-2";
+/** Request the page session announces before the worker session finishes it. */
+export const WORKER_SCRIPT_REQUEST_ID = "worker-script-request";
+const ROGUE_WORKER_SESSION_ID = "rogue-worker-session";
+/** Session the fake assigns to the attached page target. */
+const PAGE_SESSION_ID = "session-1";
+
+const dedicatedWorkerTargetInfo = (port: number) => ({
+  targetId: DEDICATED_WORKER_TARGET_ID,
+  type: "worker",
+  title: "Dedicated worker",
+  url: `http://127.0.0.1:${String(port)}/dedicated-worker.js`,
+  attached: true,
+});
+
+const nestedWorkerTargetInfo = (port: number) => ({
+  targetId: NESTED_WORKER_TARGET_ID,
+  type: "worker",
+  title: "Nested dedicated worker",
+  url: `http://127.0.0.1:${String(port)}/nested-worker.js`,
+  attached: true,
+});
+
 export const emitEvents = (
   socket: WebSocket,
   command: FakeCdpCommand,
@@ -10,10 +38,172 @@ export const emitEvents = (
 ): void => {
   emitDebuggerEvents(socket, command, port, options);
   emitNetworkEvents(socket, command, port, options);
+  emitWorkerSessionEvents(socket, command, port, options);
   emitRuntimeEvents(socket, command, port, options);
   emitWebMcpEvents(socket, command, port, options);
   emitSessionTimeline(socket, command, port, options);
   emitCaptureNavigation(socket, command, port, options);
+};
+
+const emitWorkerSessionEvents = (
+  socket: WebSocket,
+  command: FakeCdpCommand,
+  port: number,
+  options: FakeOptions,
+): void => {
+  if (options.workerStartsDuringCapture === true) {
+    emitWorkerStartupHandoff(socket, command, port);
+    return;
+  }
+  if (
+    options.dedicatedWorkerRequests !== true &&
+    options.nestedWorkerRequests !== true
+  )
+    return;
+  if (
+    command.method === "Target.setAutoAttach" &&
+    command.params.autoAttach === true
+  ) {
+    if (command.sessionId === PAGE_SESSION_ID) {
+      event(socket, "Target.attachedToTarget", PAGE_SESSION_ID, {
+        sessionId: DEDICATED_WORKER_SESSION_ID,
+        targetInfo: dedicatedWorkerTargetInfo(port),
+        waitingForDebugger: false,
+      });
+      return;
+    }
+    // Auto-attach does not recurse: the worker's own subscription attaches
+    // the worker it started, announced on the worker's flattened session.
+    if (
+      options.nestedWorkerRequests === true &&
+      command.sessionId === DEDICATED_WORKER_SESSION_ID
+    )
+      event(socket, "Target.attachedToTarget", DEDICATED_WORKER_SESSION_ID, {
+        sessionId: NESTED_WORKER_SESSION_ID,
+        targetInfo: nestedWorkerTargetInfo(port),
+        waitingForDebugger: false,
+      });
+    return;
+  }
+  if (command.method !== "Network.enable") return;
+  if (command.sessionId === DEDICATED_WORKER_SESSION_ID) {
+    const url = `http://127.0.0.1:${String(port)}/worker-api?token=worker-secret`;
+    event(socket, "Network.requestWillBeSent", DEDICATED_WORKER_SESSION_ID, {
+      requestId: "worker-request-1",
+      type: "Fetch",
+      request: { url, method: "GET" },
+      initiator: { type: "script" },
+      timestamp: 9,
+    });
+    event(socket, "Network.responseReceived", DEDICATED_WORKER_SESSION_ID, {
+      requestId: "worker-request-1",
+      response: { url, status: 200, mimeType: "application/json" },
+    });
+    event(socket, "Network.loadingFinished", DEDICATED_WORKER_SESSION_ID, {
+      requestId: "worker-request-1",
+      encodedDataLength: 21,
+    });
+    if (options.terminateDedicatedWorker === true) {
+      event(socket, "Target.detachedFromTarget", PAGE_SESSION_ID, {
+        sessionId: DEDICATED_WORKER_SESSION_ID,
+        targetId: DEDICATED_WORKER_TARGET_ID,
+      });
+      // Delivered after the detach; an unadmitted session must be ignored.
+      event(socket, "Network.requestWillBeSent", DEDICATED_WORKER_SESSION_ID, {
+        requestId: "worker-request-after-detach",
+        type: "Fetch",
+        request: {
+          url: `http://127.0.0.1:${String(port)}/worker-after-detach.json`,
+          method: "GET",
+        },
+        initiator: { type: "script" },
+      });
+    }
+    return;
+  }
+  if (
+    options.nestedWorkerRequests === true &&
+    command.sessionId === NESTED_WORKER_SESSION_ID
+  ) {
+    const url = `http://127.0.0.1:${String(port)}/nested-worker-api?token=nested-worker-secret`;
+    event(socket, "Network.requestWillBeSent", NESTED_WORKER_SESSION_ID, {
+      requestId: "nested-worker-request-1",
+      type: "Fetch",
+      request: { url, method: "GET" },
+      initiator: { type: "script" },
+      timestamp: 10,
+    });
+    event(socket, "Network.responseReceived", NESTED_WORKER_SESSION_ID, {
+      requestId: "nested-worker-request-1",
+      response: { url, status: 200, mimeType: "application/json" },
+    });
+    event(socket, "Network.loadingFinished", NESTED_WORKER_SESSION_ID, {
+      requestId: "nested-worker-request-1",
+      encodedDataLength: 21,
+    });
+    return;
+  }
+  if (command.sessionId === PAGE_SESSION_ID) {
+    // A session REA never admitted must not contribute recorded requests.
+    event(socket, "Network.requestWillBeSent", ROGUE_WORKER_SESSION_ID, {
+      requestId: "rogue-session-request",
+      type: "Fetch",
+      request: {
+        url: `http://127.0.0.1:${String(port)}/rogue-worker-session.json`,
+        method: "GET",
+      },
+      initiator: { type: "other" },
+    });
+  }
+};
+
+/**
+ * Chromium can announce a starting dedicated worker's script request on the
+ * page session and finish that same request on the flattened worker session
+ * with encodedDataLength -1 once the worker owns the fetch.
+ */
+const emitWorkerStartupHandoff = (
+  socket: WebSocket,
+  command: FakeCdpCommand,
+  port: number,
+): void => {
+  if (
+    command.method === "Network.enable" &&
+    command.sessionId === PAGE_SESSION_ID
+  ) {
+    event(socket, "Network.requestWillBeSent", PAGE_SESSION_ID, {
+      requestId: WORKER_SCRIPT_REQUEST_ID,
+      type: "Script",
+      request: {
+        url: `http://127.0.0.1:${String(port)}/dedicated-worker.js`,
+        method: "GET",
+      },
+      initiator: { type: "other" },
+      timestamp: 8,
+    });
+    return;
+  }
+  if (
+    command.method === "Target.setAutoAttach" &&
+    command.params.autoAttach === true &&
+    command.sessionId === PAGE_SESSION_ID
+  ) {
+    event(socket, "Target.attachedToTarget", command.sessionId, {
+      sessionId: DEDICATED_WORKER_SESSION_ID,
+      targetInfo: dedicatedWorkerTargetInfo(port),
+      waitingForDebugger: false,
+    });
+    return;
+  }
+  if (
+    command.method === "Network.enable" &&
+    command.sessionId === DEDICATED_WORKER_SESSION_ID
+  )
+    event(socket, "Network.loadingFinished", DEDICATED_WORKER_SESSION_ID, {
+      requestId: WORKER_SCRIPT_REQUEST_ID,
+      encodedDataLength: -1,
+      timestamp: 9,
+    });
 };
 
 const webMcpToolAnnotations = {
@@ -447,6 +637,12 @@ const emitNetworkEvents = (
   options: FakeOptions,
 ): void => {
   if (command.method !== "Network.enable") return;
+  // Worker sessions' traffic is owned by emitWorkerSessionEvents.
+  if (
+    command.sessionId === DEDICATED_WORKER_SESSION_ID ||
+    command.sessionId === NESTED_WORKER_SESSION_ID
+  )
+    return;
   if (options.navigateDuringObservationUrl !== undefined)
     event(socket, "Page.frameNavigated", command.sessionId, {
       frame: {

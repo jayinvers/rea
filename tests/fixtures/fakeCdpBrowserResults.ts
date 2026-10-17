@@ -60,6 +60,7 @@ export const resultFor = (
       return {};
     case "Debugger.enable":
       return { debuggerId: "fake-debugger" };
+    case "Target.setAutoAttach":
     case "Target.detachFromTarget":
     case "WebMCP.enable":
       return {};

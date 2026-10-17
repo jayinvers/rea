@@ -56,11 +56,16 @@ import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.
 import { err, ok, type Result } from "../domain/result.js";
 import type { JsonValue } from "../domain/jsonValue.js";
 import { jsonObjectSchema } from "../domain/jsonValue.js";
-import { hashStableFile } from "../filesystem/StableFileHash.js";
 import {
+  hashStableFile,
+  stableFileHashCause,
+} from "../filesystem/StableFileHash.js";
+import {
+  regularFileCancellation,
   RegularFileCancelled,
   RegularFileCleanupFailure,
 } from "../filesystem/OwnedRegularFile.js";
+import { RegularFileOperationCancelled } from "../filesystem/RegularFile.js";
 import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { createEvidence } from "../domain/evidence.js";
 import {
@@ -70,9 +75,13 @@ import {
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 import { PrivateRuntimeRootUnavailableError } from "../process/PrivateRuntimeRootUnavailableError.js";
 import {
-  execFileBytes,
-  execFileOutputFailure,
-} from "../process/ExecFileOutput.js";
+  adbArguments,
+  runAdb,
+  runAdbCapture,
+  packageChangeRefusal,
+  probeAdbPathExistence,
+  type AdbRunLimits,
+} from "./AdbCommand.js";
 import {
   AdbConfigurationFailure,
   adbConfigurationAvailability,
@@ -102,7 +111,6 @@ import {
   parseBugreportCopiedPath,
   parseDumpsysPackageOutput,
   parseFeatureListOutput,
-  packageChangeFailureReason,
   parsePackageChangeOutput,
   parseProcessListOutput,
   parsePngDimensions,
@@ -144,7 +152,6 @@ const SCREEN_TIMEOUT_MS = 60_000;
 const SCREEN_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const BUGREPORT_TIMEOUT_MS = 600_000;
 const BUGREPORT_MAX_OUTPUT_BYTES = 1024 * 1024;
-const STDERR_EXCERPT_BYTES = 512;
 const UNPARSED_LINES_REPORTED = 10;
 
 /** Carry the exact digest owner through caller-specific partial-result mapping. */
@@ -170,7 +177,7 @@ const hashAdbFile = async (
     return await hashStableFile(path, {
       ...(signal === undefined ? {} : { signal }),
       retainFailedClose: (handle) => {
-        closeLease = new AnalysisCleanupLease(() => handle.close());
+        closeLease = new AnalysisCleanupLease(() => handle.close(), [path]);
         resources.retain({
           kind: "lease",
           resource: `${path} (ADB digest handle)`,
@@ -180,9 +187,8 @@ const hashAdbFile = async (
     });
   } catch (cause: unknown) {
     if (
-      cause !== signal?.reason &&
-      (cause instanceof RegularFileCleanupFailure ||
-        cause instanceof RegularFileCancelled)
+      cause instanceof RegularFileCleanupFailure ||
+      cause instanceof RegularFileCancelled
     )
       throw new AdbDigestFailure(
         cause as
@@ -192,8 +198,8 @@ const hashAdbFile = async (
           closeLease?.bindCleanupError(error);
         },
       );
-    if (signal?.aborted === true)
-      throw new AnalysisCancelledError(operation, { cause });
+    if (cause instanceof RegularFileOperationCancelled)
+      throw new AnalysisCancelledError(operation, { cause: cause.reason });
     throw cause;
   }
 };
@@ -201,7 +207,6 @@ const hashAdbFile = async (
 const adbDigestError = (
   cause: unknown,
   operation: string,
-  signal: AbortSignal | undefined,
   partialObservation:
     | AdbAcquiredFilePartialObservation
     | AdbPackagePullPartialObservation,
@@ -236,12 +241,10 @@ const adbDigestError = (
   );
   const primaryCause =
     digestOutcome.kind === "failed" ? digestOutcome.cause : undefined;
-  if (
-    signal?.aborted === true ||
-    primaryCause instanceof AnalysisCancelledError
-  ) {
+  const cancellation = regularFileCancellation(digestFailure);
+  if (cancellation !== undefined) {
     const error = new AnalysisCancelledError(operation, {
-      cause: digestFailure,
+      cause: cancellation.reason,
       cleanup: { reason, resources: [resource] },
       partialObservation,
     });
@@ -256,7 +259,8 @@ const adbDigestError = (
           operation,
           `The pulled file could not be fully digested or its handle could not be closed: ${digestFailure.path}`,
           {
-            cause: primaryCause ?? digestFailure,
+            cause:
+              digestOutcome.kind === "failed" ? primaryCause : digestFailure,
             partialObservation,
           },
         );
@@ -326,7 +330,10 @@ const syncStagedAdbFile = async (
   }
   const resource = `${path} (ADB staged-output handle)`;
   const stagedOwner = owner;
-  const closeLease = new AnalysisCleanupLease(() => stagedOwner.close());
+  const closeLease = new AnalysisCleanupLease(
+    () => stagedOwner.close(),
+    [resource],
+  );
   const released = await resources.release({
     kind: "lease",
     resource,
@@ -359,150 +366,6 @@ const syncStagedAdbFile = async (
     throw reported;
   }
   if (primary !== undefined) throw primary;
-};
-
-/** adb joins shell operands into a remote POSIX command; quote at that boundary. */
-const quoteShellOperand = (value: string): string =>
-  /^[A-Za-z0-9_./:=@+,-]+$/u.test(value)
-    ? value
-    : "'" + value.replaceAll("'", "'\\''") + "'";
-
-const adbArguments = (
-  serial: string | undefined,
-  arguments_: readonly string[],
-): readonly string[] => {
-  const operands =
-    arguments_[0] === "shell"
-      ? ["shell", ...arguments_.slice(1).map(quoteShellOperand)]
-      : [...arguments_];
-  return serial === undefined ? operands : ["-s", serial, ...operands];
-};
-
-interface AdbRunLimits {
-  readonly timeoutMs: number;
-  readonly maxOutputBytes: number;
-}
-
-/** Run one bounded adb invocation and keep its exact failure shape. */
-const runAdbCapture = async (
-  operation: string,
-  targetPath: string,
-  binary: string,
-  arguments_: readonly string[],
-  limits: AdbRunLimits,
-  signal: AbortSignal | undefined,
-): Promise<Result<{ stdout: Buffer; stderr: Buffer }, AnalysisError>> => {
-  if (signal?.aborted === true)
-    return err(new AnalysisCancelledError(operation, { cause: signal.reason }));
-  try {
-    return ok(
-      await execFileBytes(binary, arguments_, {
-        timeout: limits.timeoutMs,
-        maxBuffer: limits.maxOutputBytes,
-        stopSignal: "SIGTERM",
-        ...(signal === undefined ? {} : { signal }),
-      }),
-    );
-  } catch (cause) {
-    if (signal?.aborted || execFileOutputFailure(cause)?.code === "ABORT_ERR")
-      return err(new AnalysisCancelledError(operation, { cause }));
-    const failure = execFileOutputFailure(cause);
-    if (failure === undefined)
-      return err(
-        new AnalysisProtocolError(`adb failed for ${operation}`, { cause }),
-      );
-    if (failure.outputTruncated)
-      return err(
-        new AnalysisResourceConstraintError(
-          operation,
-          "memory",
-          `adb output exceeded the ${String(limits.maxOutputBytes)}-byte capture budget`,
-          { max_output_bytes: limits.maxOutputBytes },
-          { cause },
-        ),
-      );
-    const excerpt = failure.stderr.trim().slice(0, STDERR_EXCERPT_BYTES);
-    if (/unauthorized/iu.test(excerpt))
-      return err(
-        new AnalysisUnsupportedTargetError(operation, targetPath, excerpt, {
-          cause,
-        }),
-      );
-    if (
-      /device[^\n]*not found|device offline|still authorizing|more than one device/iu.test(
-        excerpt,
-      )
-    )
-      return err(
-        new AnalysisUnsupportedTargetError(operation, targetPath, excerpt, {
-          cause,
-        }),
-      );
-    if (
-      /No such file or directory|Permission denied|read: Permission denied/iu.test(
-        excerpt,
-      )
-    )
-      return err(
-        new AnalysisUnsupportedTargetError(operation, targetPath, excerpt, {
-          cause,
-        }),
-      );
-    if (failure.killed)
-      return err(
-        new AnalysisTimeoutError(operation, limits.timeoutMs, { cause }),
-      );
-    return err(
-      new AnalysisProtocolError(
-        excerpt === ""
-          ? `adb exited with code ${String(failure.code)} for ${operation}`
-          : excerpt,
-        { cause },
-      ),
-    );
-  }
-};
-
-/** Decode textual adb protocols after the shared byte capture and error boundary. */
-const runAdb = async (
-  ...arguments_: Parameters<typeof runAdbCapture>
-): Promise<
-  Result<{ stdout: string; stderr: string; stdoutBytes: number }, AnalysisError>
-> => {
-  const captured = await runAdbCapture(...arguments_);
-  if (!captured.ok) return captured;
-  return ok({
-    stdout: captured.value.stdout.toString("utf8"),
-    stderr: captured.value.stderr.toString("utf8"),
-    // Byte count of the captured output before UTF-8 decoding, so malformed
-    // sequences replaced by U+FFFD still report their true captured size.
-    stdoutBytes: captured.value.stdout.byteLength,
-  });
-};
-
-/**
- * adb exits nonzero when the device refuses a package change, printing the
- * `Failure [...]` verdict to stderr (install) or stdout (uninstall). Read the
- * refusal from that failed run so it is not reported as unreadable output.
- */
-const packageChangeRefusal = (
-  operation: string,
-  serial: string,
-  error: AnalysisError,
-): Result<never, AnalysisError> | undefined => {
-  if (!(error instanceof AnalysisProtocolError)) return undefined;
-  const failure = execFileOutputFailure(error.cause);
-  if (failure === undefined) return undefined;
-  const reason = packageChangeFailureReason(
-    `${failure.stdout}\n${failure.stderr}`,
-  );
-  return reason === null
-    ? undefined
-    : err(
-        new AnalysisUnsupportedTargetError(operation, serial, reason, {
-          cause: error,
-        }),
-      );
 };
 
 const clientIdentityResult = (
@@ -605,7 +468,10 @@ const publishScreenExclusively = async (
   // the visible file despite later cancellation so its receipt remains known.
   const ownedOutput = new OwnedFileHandle(output);
   const handleResource = `${outputPath} (ADB publication handle)`;
-  const closeOnly = new AnalysisCleanupLease(() => ownedOutput.close());
+  const closeOnly = new AnalysisCleanupLease(
+    () => ownedOutput.close(),
+    [handleResource],
+  );
   const removeOutput = async (
     expected: Awaited<ReturnType<typeof output.stat>>,
   ): Promise<void> => {
@@ -1427,7 +1293,7 @@ export class AdbProvider {
       selection = this.selection();
       identity = await inspectAdbClient(selection, signal);
     } catch (cause) {
-      if (cause instanceof AnalysisCancelledError) return err(cause);
+      if (cause instanceof AnalysisError) return err(cause);
       if (cause instanceof AdbConfigurationFailure)
         return err(
           providerConfigurationRefusal(
@@ -1870,38 +1736,30 @@ export class AdbProvider {
         );
       }
       case "inspect_adb_window": {
-        let section = "windows";
+        let section: "windows" | "displays" = "windows";
         const ran = await shell(["dumpsys", "window", section], {
           timeoutMs: SHELL_TIMEOUT_MS,
           maxOutputBytes: DUMPSYS_WINDOW_MAX_OUTPUT_BYTES,
         });
         if (!ran.ok) return ran;
-        let { focusedWindow, focusedApp } = parseWindowFocusOutput(
-          ran.value.stdout,
-        );
-        if (focusedWindow === null && focusedApp === null) {
+        let focus = parseWindowFocusOutput(ran.value.stdout);
+        if (focus.focus_summary === "unavailable") {
           section = "displays";
           const fallback = await shell(["dumpsys", "window", section], {
             timeoutMs: SHELL_TIMEOUT_MS,
             maxOutputBytes: DUMPSYS_WINDOW_MAX_OUTPUT_BYTES,
           });
           if (!fallback.ok) return fallback;
-          ({ focusedWindow, focusedApp } = parseWindowFocusOutput(
-            fallback.value.stdout,
-          ));
+          focus = parseWindowFocusOutput(fallback.value.stdout);
         }
-        const declared = focusedWindow !== null || focusedApp !== null;
+        const declared = focus.focus_summary !== "unavailable";
         return ok(
           createAnalysisExecution(
             {
               client,
               serial: request.input.serial,
-              focused_window: focusedWindow,
-              focused_app: focusedApp,
-              observed_lines: [
-                ...(focusedWindow === null ? [] : [focusedWindow]),
-                ...(focusedApp === null ? [] : [focusedApp]),
-              ],
+              source_section: section,
+              ...focus,
             },
             provider,
             {
@@ -1910,6 +1768,11 @@ export class AdbProvider {
                 declared
                   ? `Focus declarations were read from \`dumpsys window ${section}\``
                   : "Neither `dumpsys window windows` nor `dumpsys window displays` declared mCurrentFocus or mFocusedApp; focus is unknown, not absent",
+                ...(focus.focus_summary === "ambiguous"
+                  ? [
+                      "Multiple focus contexts or repeated declarations prevent a singular focus summary; inspect focus_contexts for every declaration",
+                    ]
+                  : []),
               ],
             },
           ),
@@ -2221,7 +2084,14 @@ export class AdbProvider {
       device_path: string | null;
       stage: "resolve_paths" | "pull" | "digest";
       message: string;
+      cause: unknown;
     }[] = [];
+    const observedFailures = () =>
+      failures.map(({ device_path, stage, message }) => ({
+        device_path,
+        stage,
+        message,
+      }));
     const cancelledPackagePull = (
       error: AnalysisCancelledError,
       localPath: string,
@@ -2238,7 +2108,7 @@ export class AdbProvider {
           output_directory: directory.value,
           artifacts,
           failures: [
-            ...failures,
+            ...observedFailures(),
             {
               device_path: devicePath,
               stage,
@@ -2275,6 +2145,7 @@ export class AdbProvider {
           device_path: entry.device_path,
           stage: "pull",
           message: pulled.error.message,
+          cause: pulled.error,
         });
         continue;
       }
@@ -2325,7 +2196,7 @@ export class AdbProvider {
                     },
                   ],
             failures: [
-              ...failures,
+              ...observedFailures(),
               {
                 device_path: entry.device_path,
                 stage: "digest",
@@ -2343,7 +2214,6 @@ export class AdbProvider {
         const cleanupError = adbDigestError(
           cause,
           operation,
-          signal,
           partialObservation,
         );
         if (cleanupError !== undefined) return err(cleanupError);
@@ -2354,16 +2224,24 @@ export class AdbProvider {
             entry.device_path,
             "digest",
           );
+        const physicalCause = stableFileHashCause(cause);
         failures.push({
           device_path: entry.device_path,
           stage: "digest",
-          message: `The pulled file could not be read back after pulling: ${localPath}`,
+          message: `The pulled file could not be read back after pulling: ${localPath}: ${physicalCause instanceof Error ? physicalCause.message : String(physicalCause)}`,
+          cause,
         });
       }
     }
     if (artifacts.length === 0 && failures.length > 0) {
       const primary = new AnalysisProtocolError(
         `Every APK pull failed for ${packageName} on ${serial}: ${failures[0]!.message}`,
+        {
+          cause: new AggregateError(
+            failures.map(({ cause }) => cause),
+            "APK pulls failed",
+          ),
+        },
       );
       return failOwnedPackage(primary);
     }
@@ -2375,7 +2253,7 @@ export class AdbProvider {
           package_name: packageName,
           output_directory: directory.value,
           artifacts,
-          failures,
+          failures: observedFailures(),
           coverage: failures.length === 0 ? "complete" : "partial",
         },
         provider,
@@ -2466,12 +2344,7 @@ export class AdbProvider {
           digest_status: "unknown",
         },
       };
-      const cleanupError = adbDigestError(
-        cause,
-        operation,
-        signal,
-        partialObservation,
-      );
+      const cleanupError = adbDigestError(cause, operation, partialObservation);
       if (cleanupError !== undefined) return err(cleanupError);
       if (cause instanceof AnalysisCancelledError) {
         cause.retainPartialObservation(partialObservation);
@@ -2529,28 +2402,16 @@ export class AdbProvider {
           operation,
           signal,
         );
-        // `test -e` exits nonzero with no adb diagnosis when the path is absent.
-        // Any other probe failure leaves existence unknown, so it is reported as
-        // such rather than treated as absence or followed by a push.
-        const existsProbe = await runAdb(
+        const existsProbe = await probeAdbPathExistence(
           operation,
+          input.serial,
           input.device_path,
           selection.binary,
-          adbArguments(input.serial, [
-            "shell",
-            "test",
-            "-e",
-            input.device_path,
-          ]),
           { timeoutMs: SETTINGS_TIMEOUT_MS, maxOutputBytes: 1024 },
           signal,
         );
-        if (
-          !existsProbe.ok &&
-          !(existsProbe.error instanceof AnalysisProtocolError)
-        )
-          return existsProbe;
-        const deviceExists = existsProbe.ok;
+        if (!existsProbe.ok) return existsProbe;
+        const deviceExists = existsProbe.value;
         if (deviceExists && !input.overwrite)
           return err(
             new AnalysisOutputError(
@@ -2760,7 +2621,14 @@ export class AdbProvider {
       operation,
       input.serial,
       selection.binary,
-      adbArguments(input.serial, ["uninstall", input.package]),
+      adbArguments(input.serial, [
+        "shell",
+        "pm",
+        "uninstall",
+        "--user",
+        "0",
+        input.package,
+      ]),
       {
         timeoutMs: PACKAGE_LIST_TIMEOUT_MS,
         maxOutputBytes: PULL_MAX_OUTPUT_BYTES,
@@ -2791,7 +2659,7 @@ export class AdbProvider {
         provider,
         {
           limitations: [
-            "Uninstall removes the package and its data for user 0; keeping data (-k) is not exposed",
+            "Uninstall explicitly requests user 0 without data retention (-k); device enforcement is not independently verified",
           ],
         },
       ),
@@ -3293,7 +3161,7 @@ export class AdbProvider {
         const cleanupError =
           retainedObservation === undefined
             ? undefined
-            : adbDigestError(cause, operation, signal, retainedObservation);
+            : adbDigestError(cause, operation, retainedObservation);
         if (cleanupError !== undefined) return err(cleanupError);
         if (cause instanceof AnalysisCancelledError) {
           if (retainedObservation !== undefined)

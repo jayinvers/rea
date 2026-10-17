@@ -16,6 +16,13 @@ import type {
 } from "./fakeCdpBrowserTypes.js";
 
 export type { FakeCdpBrowser, FakeOptions } from "./fakeCdpBrowserTypes.js";
+export {
+  DEDICATED_WORKER_SESSION_ID,
+  DEDICATED_WORKER_TARGET_ID,
+  NESTED_WORKER_SESSION_ID,
+  NESTED_WORKER_TARGET_ID,
+  WORKER_SCRIPT_REQUEST_ID,
+} from "./fakeCdpBrowserEvents.js";
 /** Start a real HTTP/WebSocket fake at the same seams as a user-owned browser. */
 export const startFakeCdpBrowser = async (
   options: FakeOptions = {},
@@ -67,6 +74,7 @@ export const startFakeCdpBrowser = async (
         return;
       }
       if (options.hangOnMethod === command.method) return;
+      if (options.hangOnCommand?.(command) === true) return;
       if (options.malformedMessageOnMethod === command.method) {
         socket.send("{not-json");
         return;

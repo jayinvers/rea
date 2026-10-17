@@ -119,6 +119,38 @@ try {
   );
   if (!observed.ok) throw observed.error;
   assertObservation(observed.value, site.origin);
+  const workerRequests = observed.value.network.requests.filter(
+    (request) => request.worker_target_id !== null,
+  );
+  if (
+    workerRequests.length < 1 ||
+    !workerRequests.some((request) =>
+      request.url.includes("token=worker-network-secret-value"),
+    ) ||
+    observed.value.network.requests.some(
+      (request) =>
+        request.url.includes("token=worker-network-secret-value") &&
+        request.worker_target_id === null,
+    )
+  )
+    throw new Error(
+      "Real Chrome dedicated worker requests were not recorded with worker attribution",
+    );
+  // The dedicated worker starts another worker; its requests must be recorded
+  // with the nested worker's own target attribution, not dropped or misfiled.
+  if (
+    !workerRequests.some((request) =>
+      request.url.includes("token=nested-worker-network-secret-value"),
+    ) ||
+    observed.value.network.requests.some(
+      (request) =>
+        request.url.includes("token=nested-worker-network-secret-value") &&
+        request.worker_target_id === null,
+    )
+  )
+    throw new Error(
+      "Real Chrome nested worker requests were not recorded with worker attribution",
+    );
   const domDestinations = await verifyBrowserDomDestinations({
     cdp_endpoint: endpoint,
     target_id: target,
@@ -386,6 +418,7 @@ try {
     accessibilityNodes: observed.value.accessibility.nodes.length,
     scripts: observed.value.scripts.items.length,
     networkRequests: observed.value.network.requests.length,
+    workerNetworkRequests: workerRequests.length,
     consoleEvents: observed.value.console.events.length,
     websocketConnections: observed.value.network.websocket_connections.length,
     websocketFrames: observed.value.network.websocket_connections.reduce(

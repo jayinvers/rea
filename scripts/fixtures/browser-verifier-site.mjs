@@ -129,6 +129,24 @@ export async function startBrowserVerifierSite() {
       response.end(browserScript(port));
       return;
     }
+    if (request.url?.startsWith("/worker.js") === true) {
+      response.setHeader("content-type", "text/javascript");
+      response.setHeader("cache-control", "no-store");
+      response.end(dedicatedWorkerScript(port));
+      return;
+    }
+    if (request.url?.startsWith("/nested-worker.js") === true) {
+      response.setHeader("content-type", "text/javascript");
+      response.setHeader("cache-control", "no-store");
+      response.end(nestedWorkerScript());
+      return;
+    }
+    if (request.url?.startsWith("/worker-api") === true) {
+      response.setHeader("content-type", "application/json");
+      response.setHeader("cache-control", "no-store");
+      response.end('{"ok":true,"secret":"worker-response-secret-value"}');
+      return;
+    }
     if (request.url?.startsWith("/bad.js") === true) {
       response.setHeader("content-type", "text/javascript");
       response.end(
@@ -214,6 +232,10 @@ const browserScript = (port) => `
   localStorage.setItem("rea-storage-key", "storage-secret-value");
   indexedDB.open("rea-browser-db", 1);
   caches.open("rea-browser-cache");
+  // One long-lived dedicated worker, started before REA attaches, issues its
+  // own network traffic that page-session-only capture would silently drop.
+  const dedicatedWorker = new Worker("/worker.js");
+  dedicatedWorker.onmessage = (event) => console.log("rea-worker-marker", event.data);
   const observe = () => {
     console.log("rea-browser-observation", "authorization=Bearer console-secret-value");
     fetch("/api?token=network-secret-value", {
@@ -249,6 +271,25 @@ const browserScript = (port) => `
     history.pushState({}, "", sessionUrl);
   }, 100);
   //# sourceMappingURL=/app.js.map
+`;
+
+const dedicatedWorkerScript = (port) => `
+  // A dedicated worker starting another worker exercises nested worker
+  // attachment; page-session auto-attach alone never reaches this child.
+  const nestedWorker = new Worker("/nested-worker.js");
+  const observe = () =>
+    fetch("/worker-api?token=worker-network-secret-value", { cache: "no-store" })
+      .then((response) => postMessage(\`worker-fetch-\${response.status}\`))
+      .catch(() => postMessage("worker-fetch-failed"));
+  observe();
+  setInterval(observe, 200);
+`;
+
+const nestedWorkerScript = () => `
+  const observe = () =>
+    fetch("/worker-api?token=nested-worker-network-secret-value", { cache: "no-store" }).catch(() => {});
+  observe();
+  setInterval(observe, 200);
 `;
 
 const sourceMap = () =>

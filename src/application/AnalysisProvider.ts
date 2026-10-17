@@ -1,3 +1,4 @@
+import type { ProviderInspectionScope } from "../providers/ProviderInspectionScope.js";
 import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 import type { OfficialToolName } from "../contracts/officialToolContracts.js";
 import type { EnhancedToolName } from "../contracts/enhancedInputs.js";
@@ -158,6 +159,8 @@ export interface AnalysisClient extends AnalysisOperationPort {
   runtimeLineageSnapshots?(): readonly ProviderRuntimeLineageSnapshot[];
   /** Current provider work that may outlive a timed-out or cancelled caller. */
   requestActivitySnapshots?(): readonly ProviderRequestActivitySnapshot[];
+  /** Local reuse admission is separate from observed native process health. */
+  reuseReadiness?(): "ready" | "blocked" | "unknown";
   /** Current operational health for the active provider bridge. */
   operationHealthSnapshot?(): ProviderOperationHealth | undefined;
   /** Close owned resources and retain failed cleanup for a later retry. */
@@ -191,8 +194,12 @@ export interface AnalysisProfileResolution {
 }
 
 /** Cancellation context for side-effect-free provider profile resolution. */
-export interface AnalysisProfileResolutionOptions {
+export interface AnalysisProviderInspectionOptions {
   readonly signal?: AbortSignal;
+  readonly scope?: ProviderInspectionScope;
+}
+
+export interface AnalysisProfileResolutionOptions extends AnalysisProviderInspectionOptions {
   readonly fileCloseResources?: FileCloseResourceOwner;
 }
 
@@ -290,12 +297,25 @@ export interface AnalysisProviderReadinessSnapshot {
 
 /** Deep provider candidate discoverable before one target-bound route is chosen. */
 export interface AnalysisProviderCandidate extends AnalysisProvider {
+  /**
+   * Own inspection through final reads and cleanup. Observe the supplied owner
+   * signal cooperatively; resolve only after finalization settles, retaining any
+   * failed cleanup capability. Registry cancellation and shutdown join this
+   * completion rather than abandoning the promise.
+   */
   resolveAnalysisProfile(
     target: BinaryTarget,
     options?: AnalysisProfileResolutionOptions,
   ): Promise<Result<AnalysisProfileResolution, AnalysisError>>;
-  inspectAvailability(): ProviderAvailability;
-  inspectReadinessSnapshot?(): AnalysisProviderReadinessSnapshot;
+  /** Await prerequisite observations and finalization under the supplied owner signal. */
+  inspectAvailability(
+    options?: AnalysisProviderInspectionOptions,
+  ): ProviderAvailability | Promise<ProviderAvailability>;
+  inspectReadinessSnapshot?(
+    options?: AnalysisProviderInspectionOptions,
+  ):
+    | AnalysisProviderReadinessSnapshot
+    | Promise<AnalysisProviderReadinessSnapshot>;
   inspectTargetSupport(target: BinaryTarget): ProviderTargetSupport;
   /** Observe retained candidate cleanup without starting or retrying work. */
   hasPendingOwnedResources?(): boolean;

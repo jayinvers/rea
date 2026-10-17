@@ -153,6 +153,13 @@ const browserNetworkRequestSchema = z.object({
     line: z.number().int().min(0).nullable(),
     column: z.number().int().min(0).nullable(),
   }),
+  worker_target_id: z
+    .string()
+    .nullable()
+    .default(null)
+    .describe(
+      "Target ID of the attached worker session that issued this request; null when the page session issued it.",
+    ),
   body_shapes: z.object({
     status: z.enum(["not_approved", "included", "partial", "unavailable"]),
     request: jsonShapeSchema.nullable(),

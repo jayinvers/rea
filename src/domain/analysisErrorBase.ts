@@ -53,6 +53,8 @@ export interface AnalysisCleanupObservation {
 
 /** Optional provider-neutral context that must survive typed error projection. */
 export interface AnalysisErrorOptions extends ErrorOptions {
+  /** Typed primary retained when a later lifecycle failure composes this error. */
+  readonly cleanupPrimary?: AnalysisError | undefined;
   /** Producer-owned, caller-safe facts retained through every typed projection. */
   readonly diagnostics?: Readonly<Record<string, JsonValue>> | undefined;
   readonly capturedOutput?: AnalysisCapturedOutput | undefined;
@@ -60,17 +62,25 @@ export interface AnalysisErrorOptions extends ErrorOptions {
   readonly partialObservation?: AnalysisPartialObservation | undefined;
 }
 
+/** Exact cleanup owner that can attribute its currently unresolved resources. */
+export interface AnalysisCleanupResourceOwner {
+  readonly cleanupResources: readonly string[] | undefined;
+}
+
 /** Base class for expected analysis, provider, and session failures. */
 export abstract class AnalysisError extends Error {
+  readonly #cleanupPrimary: AnalysisError | undefined;
   readonly #cleanupDependencies = new Set<AnalysisError>();
   #cleanupDependents: WeakRef<AnalysisError>[] = [];
   readonly diagnostics: Readonly<Record<string, JsonValue>> | undefined;
   readonly capturedOutput: AnalysisCapturedOutput | undefined;
   readonly cleanup: AnalysisCleanupObservation | undefined;
   cleanupIncomplete: boolean;
-  readonly cleanupResources: readonly string[];
+  #ownedCleanupResources: readonly string[];
+  #cleanupResourceOwner: AnalysisCleanupResourceOwner | undefined;
   constructor(message: string, options?: AnalysisErrorOptions) {
     super(message, options);
+    this.#cleanupPrimary = options?.cleanupPrimary;
     this.diagnostics =
       options?.diagnostics === undefined
         ? undefined
@@ -81,7 +91,7 @@ export abstract class AnalysisError extends Error {
         : { ...options.capturedOutput };
     this.cleanup = options?.cleanup;
     this.cleanupIncomplete = options?.cleanup !== undefined;
-    this.cleanupResources = options?.cleanup?.resources ?? [];
+    this.#ownedCleanupResources = [...(options?.cleanup?.resources ?? [])];
     this.partialObservation = options?.partialObservation;
   }
   abstract readonly _tag: AnalysisErrorTag;
@@ -89,7 +99,38 @@ export abstract class AnalysisError extends Error {
   readonly userCategory: "cancelled" | undefined = undefined;
   readonly executionFailure: string | undefined = undefined;
   partialObservation: AnalysisPartialObservation | undefined;
+
+  get cleanupPrimary(): AnalysisError | undefined {
+    return this.#cleanupPrimary;
+  }
   readonly cleanupReport: ProcessCaptureCleanupReport | undefined = undefined;
+
+  /** Live dependencies own current resource attribution; cleanup keeps history. */
+  get cleanupResources(): readonly string[] {
+    if (this.#cleanupDependencies.size === 0)
+      return (
+        this.#cleanupResourceOwner?.cleanupResources ??
+        this.#ownedCleanupResources
+      );
+    return [
+      ...new Set(
+        [...this.#cleanupDependencies]
+          .filter((dependency) => dependency.cleanupIncomplete)
+          .flatMap((dependency) => dependency.cleanupResources),
+      ),
+    ];
+  }
+
+  /** Bind attribution only to the producer that owns the complete cleanup set. */
+  bindCleanupResourceOwner(owner: AnalysisCleanupResourceOwner): this {
+    this.#cleanupResourceOwner = owner;
+    return this;
+  }
+
+  /** Initialize resource facts supplied by a more specific error producer. */
+  protected setCleanupResources(resources: readonly string[]): void {
+    this.#ownedCleanupResources = [...resources];
+  }
 
   /** Retain a later lifecycle failure without replacing the original typed error. */
   retainSecondaryFailure(
@@ -151,6 +192,13 @@ export abstract class AnalysisError extends Error {
     return this;
   }
 }
+
+/** Confirmed cleanup reveals the typed primary; unresolved ownership stays visible. */
+export const resolvedAnalysisError = (error: AnalysisError): AnalysisError => {
+  while (!error.cleanupIncomplete && error.cleanupPrimary !== undefined)
+    error = error.cleanupPrimary;
+  return error;
+};
 import type {
   PartialProcessCaptureObservation,
   ProcessCaptureCleanupReport,

@@ -93,6 +93,7 @@ export const targets = (
         },
       ]
     : []),
+  ...(options.nestedWorkerRequests === true ? nestedWorkerTargets(port) : []),
   ...(options.electronFileUrl === undefined
     ? []
     : [
@@ -130,6 +131,28 @@ export const targets = (
           openerId: "electron-page",
         },
       ]),
+];
+
+/** Terminal inventory entries for the dedicated worker and the worker it starts. */
+const nestedWorkerTargets = (
+  port: number,
+): readonly Record<string, unknown>[] => [
+  {
+    id: "worker-attached-1",
+    type: "worker",
+    title: "Dedicated worker",
+    url: `http://127.0.0.1:${String(port)}/dedicated-worker.js`,
+    attached: true,
+    parentFrameId: "frame-main",
+  },
+  {
+    id: "worker-attached-2",
+    type: "worker",
+    title: "Nested dedicated worker",
+    url: `http://127.0.0.1:${String(port)}/nested-worker.js`,
+    attached: true,
+    parentFrameId: "frame-main",
+  },
 ];
 
 const allowedPageTitle = (

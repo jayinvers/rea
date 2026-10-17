@@ -18,6 +18,14 @@ export interface CapturedScript {
 
 export type NetworkState = WebPageInspection["network"]["requests"][number];
 
+/**
+ * Session attribution for events observed on an admitted worker session.
+ * Multiplexed ingest attaches it so requests retain their issuing worker.
+ */
+export interface CdpNetworkEventSource {
+  readonly worker_target_id: string;
+}
+
 /** Bounds retained CDP script identities independently from source text capture. */
 export const CDP_CAPTURE_SCRIPT_METADATA_LIMITS = {
   retainedBytes: 8 * 1024 * 1024,
