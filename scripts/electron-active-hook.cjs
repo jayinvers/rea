@@ -1,10 +1,38 @@
 "use strict";
 
+const applyFunction = Reflect.apply;
+const applyArguments = Function.prototype.apply;
+const bindFunction = Function.prototype.bind;
+const callFunction = Function.prototype.call;
+const arrayFrom = Array.from;
+const defineProperty = Object.defineProperty;
+const ownPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const getPrototypeOf = Object.getPrototypeOf;
+const nativeFunctionPrototype = getPrototypeOf(callFunction);
+const getProperty = Reflect.get;
+const setProperty = Reflect.set;
+const SetConstructor = Set;
+const ProxyConstructor = Proxy;
+const bindBuiltinMethod = (method) =>
+  applyFunction(bindFunction, callFunction, [method]);
+const forEachMapEntry = bindBuiltinMethod(Map.prototype.forEach);
+const sliceArguments = bindBuiltinMethod(Array.prototype.slice);
+const arrayLastIndexOf = bindBuiltinMethod(Array.prototype.lastIndexOf);
+const arrayPush = bindBuiltinMethod(Array.prototype.push);
+const arrayPop = bindBuiltinMethod(Array.prototype.pop);
+const weakMapHas = bindBuiltinMethod(WeakMap.prototype.has);
+const weakMapGet = bindBuiltinMethod(WeakMap.prototype.get);
+const weakMapSet = bindBuiltinMethod(WeakMap.prototype.set);
+const setHas = bindBuiltinMethod(Set.prototype.has);
+const setAdd = bindBuiltinMethod(Set.prototype.add);
+const hasOwnProperty = bindBuiltinMethod(Object.prototype.hasOwnProperty);
+
+const { isProxy } = require("node:util").types;
 const {
   createElectronActiveBoundaryPatches,
 } = require("./electron-active-hook-boundaries.cjs");
 
-const ipcEventKinds = new Set([
+const ipcEventKinds = new SetConstructor([
   "main-handler-invocation",
   "main-event-invocation",
   "utility-process-fork",
@@ -98,7 +126,7 @@ const eventFamily = (kind, processTypeValue) => {
     return "preload-configuration";
   if (kind.startsWith("ipc-renderer"))
     return processTypeValue === "renderer" ? "renderer-ipc" : "ipc";
-  return ipcEventKinds.has(kind) ? "ipc" : kind;
+  return setHas(ipcEventKinds, kind) ? "ipc" : kind;
 };
 
 const noteDropped = (kind, processTypeValue, isIpc) => {
@@ -163,7 +191,7 @@ const frameIdentity = (event) => {
 
 const record = (event) => {
   observed += 1;
-  const isIpc = ipcEventKinds.has(event.kind);
+  const isIpc = setHas(ipcEventKinds, event.kind);
   if (isIpc) observedIpc += 1;
   else observedRuntime += 1;
   const raw = {
@@ -191,7 +219,7 @@ const record = (event) => {
     ...event,
   };
   const shapeGroups = Array.isArray(raw.argument_shape_value_groups)
-    ? raw.argument_shape_value_groups.filter(Array.isArray)
+    ? raw.argument_shape_value_groups
     : Array.isArray(raw.argument_shape_values)
       ? [raw.argument_shape_values]
       : [];
@@ -242,11 +270,13 @@ const record = (event) => {
           eventBytes + estimatedRetainedBytes + snapshotEnvelopeReserveBytes >
           retentionBudgetBytes;
       };
-      for (const group of shapeGroups)
+      for (const group of shapeGroups) {
+        if (!Array.isArray(group)) continue;
         for (const argument of group) {
           countShape(argument);
           if (shapeOverflow) break;
         }
+      }
       if (shapeOverflow) {
         noteDropped(raw.kind, retainedEvent.process_type, isIpc);
         return null;
@@ -290,9 +320,11 @@ const record = (event) => {
     noteDropped(raw.kind, retainedEvent.process_type, isIpc);
     return null;
   }
-  for (const group of shapeGroups)
+  for (const group of shapeGroups) {
+    if (!Array.isArray(group)) continue;
     for (const argument of group)
       retainedEvent.argument_shapes.push(shape(argument));
+  }
   for (const valueShape of existingShapes)
     retainedEvent.argument_shapes.push(
       typeof valueShape === "string" ? valueShape : "unknown",
@@ -316,6 +348,14 @@ const recordIpc = (kind, channel, args, details = {}) =>
       ...details,
     });
   })();
+
+const recordIpcObservationGap = (channel, event, error = false) =>
+  recordRuntime("ipc-observation-gap", event, error ? "failed" : "observed", {
+    channel,
+    target: "ipcMain.on",
+    process_type: "main",
+    error,
+  });
 
 const patchEmitter = (emitter, observeEvent) => {
   if (emitter === null || emitter === undefined) return;
@@ -343,43 +383,553 @@ const recordInvocation = (kind, channel, event, args) =>
     error: false,
   });
 
+const invokeObservedEventListener = (thisArg, channel, listener, args) => {
+  // Recording slices an actual invocation frame, avoiding Array species;
+  // callback dispatch keeps its native Array/Arguments representation.
+  const recorded = recordInvocation(
+    "main-event-invocation",
+    channel,
+    args[0],
+    sliceArguments(args, 1),
+  );
+  try {
+    return applyFunction(listener, thisArg, args);
+  } catch (cause) {
+    if (recorded !== null) recorded.error = true;
+    throw cause;
+  }
+};
+
+// Recording wrappers follow EventEmitter's own wrapper convention: `.listener`
+// names the caller's function so native removal can match it. Node retains
+// ownership of listener traversal and meta-events; hook-created "on" entries
+// are translated before calling the application's removal method/decorators.
+// Only hook-created wrappers are tracked, by the registration they stand in
+// for: they already record, so patched on() registers them as is. An "on"
+// wrapper stands in for the caller's raw function and a "once" wrapper for
+// EventEmitter's once wrapper, which removeAllListeners reports accordingly.
+// The value is the native removal argument: the app function for an "on"
+// wrapper, or the wrapper itself for "once". Public .listener is mutable;
+// it is not the authority for the original function's identity.
+const hookListenerRemovalTargets = new WeakMap();
+const MAX_LISTENER_CHAIN_HOPS = 16;
+
+// Parse native property lookup without invoking application getters or Proxy
+// traps. Undefined means absent; null means the lookup is unknown.
+const lookupPropertyDescriptor = (listener, key) => {
+  let candidate = listener;
+  for (
+    let hops = 0;
+    hops <= MAX_LISTENER_CHAIN_HOPS && candidate !== null;
+    hops += 1
+  ) {
+    if (isProxy(candidate)) return null;
+    const descriptor = ownPropertyDescriptor(candidate, key);
+    if (descriptor !== undefined) return descriptor;
+    candidate = getPrototypeOf(candidate);
+  }
+  return candidate === null ? undefined : null;
+};
+
+const listenerDataDescriptor = (listener) => {
+  const descriptor = lookupPropertyDescriptor(listener, "listener");
+  if (descriptor === null || descriptor === undefined) return descriptor;
+  if (hasOwnProperty(descriptor, "value")) return descriptor;
+  // A setter-only property shadows ancestors with a known undefined read.
+  return descriptor.get === undefined ? undefined : null;
+};
+
+// A decorator that wraps once's hook wrapper and names it through `.listener`
+// already records through that wrapper. Registering the decorator as is keeps
+// native self-removal working: the once wrapper removes itself by identity, and
+// removeListener matches the decorator through its `.listener`.
+const classifyHookListenerWrapper = (listener) => {
+  const visited = new SetConstructor();
+  let candidate = listener;
+  for (
+    let hops = 0;
+    hops <= MAX_LISTENER_CHAIN_HOPS && typeof candidate === "function";
+    hops += 1
+  ) {
+    if (weakMapHas(hookListenerRemovalTargets, candidate)) return "owned";
+    if (setHas(visited, candidate)) return "unowned";
+    setAdd(visited, candidate);
+    const descriptor = listenerDataDescriptor(candidate);
+    if (descriptor === null) return "unknown";
+    candidate = descriptor?.value;
+  }
+  return typeof candidate === "function" ? "unknown" : "unowned";
+};
+
+const createObservedOnceCallback = (target, channel, listener, receiver) => {
+  // A private callable target avoids Proxy get invariants on an app's
+  // non-configurable, read-only call/apply properties. It never escapes
+  // through the native once wrapper's public listener link.
+  const callback = new ProxyConstructor(
+    function observedOnceListener() {
+      return invokeObservedEventListener(
+        this === receiver ? target : this,
+        channel,
+        listener,
+        arguments,
+      );
+    },
+    {
+      get: (_callable, key) => {
+        let value;
+        try {
+          value = getProperty(listener, key, listener);
+        } catch (cause) {
+          if (key === "call" || key === "apply")
+            recordIpcObservationGap(channel, `custom-${key}`, true);
+          throw cause;
+        }
+        if (key !== "call" && key !== "apply") return value;
+        if (typeof value !== "function") {
+          recordIpcObservationGap(channel, `custom-${key}`, true);
+          return value;
+        }
+        if (value === callFunction || value === applyArguments) return value;
+        // A runtime that selects an application method must preserve that
+        // method's receiver and original argument-list object. Its body may
+        // bypass the callable Proxy, so retain a gap rather than an invocation.
+        return new ProxyConstructor(value, {
+          apply: (method, thisArg, args) => {
+            const gap = recordIpcObservationGap(channel, `custom-${key}`);
+            if (args[0] === receiver) args[0] = target;
+            try {
+              return applyFunction(
+                method,
+                thisArg === callback ? listener : thisArg,
+                args,
+              );
+            } catch (cause) {
+              if (gap !== null) {
+                gap.error = true;
+                gap.phase = "failed";
+              }
+              throw cause;
+            }
+          },
+        });
+      },
+    },
+  );
+  return callback;
+};
+
 const patchIpcMain = (ipcMain) => {
   if (ipcMain === null || ipcMain === undefined) return;
-  for (const [method, kind] of [
-    ["handle", "main-handler-invocation"],
-    ["on", "main-event-invocation"],
-    ["once", "main-event-invocation"],
-  ]) {
-    const original = ipcMain[method];
-    if (typeof original !== "function") continue;
-    ipcMain[method] = function patchedIpcMain(channel, listener) {
+  // Wrapper removals whose translated call is still running. Each flight
+  // names the channel and wrapper a removeAllListeners traversal is
+  // removing and whether that same wrapper was re-registered on that
+  // channel during the call.
+  const listenerRemovalFlights = [];
+  const { handle, on, once, removeAllListeners } = ipcMain;
+  let unobservedOnceScope = null;
+  if (typeof handle === "function")
+    ipcMain.handle = function patchedIpcMainHandle(channel, listener) {
       if (typeof listener !== "function")
-        return original.call(this, channel, listener);
-      const wrapped =
-        kind === "main-handler-invocation"
-          ? async function wrappedHandler(event, ...args) {
-              const recorded = recordInvocation(kind, channel, event, args);
-              try {
-                const result = await listener.call(this, event, ...args);
-                if (recorded !== null) recorded.result_shape = shape(result);
+        return handle.call(this, channel, listener);
+      return handle.call(
+        this,
+        channel,
+        async function wrappedHandler(event, ...args) {
+          const recorded = recordInvocation(
+            "main-handler-invocation",
+            channel,
+            event,
+            args,
+          );
+          try {
+            const result = await applyFunction(listener, this, arguments);
+            if (recorded !== null) recorded.result_shape = shape(result);
+            return result;
+          } catch (cause) {
+            if (recorded !== null) recorded.error = true;
+            throw cause;
+          }
+        },
+      );
+    };
+  if (typeof on !== "function") return;
+  ipcMain.on = function patchedIpcMainOn(channel, listener) {
+    if (typeof listener !== "function") return on.call(this, channel, listener);
+    if (unobservedOnceScope !== null) {
+      const scope = unobservedOnceScope;
+      const result = on.call(this, channel, listener);
+      recordIpcObservationGap(channel, "once-metadata");
+      if (scope.channel === channel) scope.gapRecorded = true;
+      return result;
+    }
+    const wrapperStatus = classifyHookListenerWrapper(listener);
+    if (wrapperStatus !== "unowned") {
+      // Registering a wrapper whose translated removal is still in
+      // flight (an observer restoring a saved raw entry) adds a NEW
+      // registration, not the one being removed. Identity can no longer
+      // name the original registration, so every in-flight completion
+      // for that wrapper on the SAME channel must stand down instead of
+      // deleting the restore; registering it on another channel is a
+      // separate registration and leaves the original completion armed.
+      if (listenerRemovalFlights.length !== 0) {
+        for (
+          let index = listenerRemovalFlights.length - 1;
+          index >= 0;
+          index -= 1
+        ) {
+          const flight = listenerRemovalFlights[index];
+          if (flight.entry === listener && flight.channel === channel)
+            flight.reregistered = true;
+        }
+      }
+      const result = on.call(this, channel, listener);
+      if (wrapperStatus === "unknown")
+        recordIpcObservationGap(channel, "listener-chain");
+      return result;
+    }
+    const wrapped = function wrappedEventListener() {
+      return invokeObservedEventListener(this, channel, listener, arguments);
+    };
+    // Native single-listener dispatch reads .apply; array dispatch invokes the
+    // function directly. Let Node select that path without inspecting or
+    // copying the emitter's listener storage, including during reentrant emits.
+    defineProperty(wrapped, "apply", {
+      configurable: true,
+      writable: true,
+      value: function nativeApply(...methodArgs) {
+        let applicationApply;
+        try {
+          applicationApply = listener.apply;
+        } catch (cause) {
+          recordIpcObservationGap(channel, "custom-apply", true);
+          throw cause;
+        }
+        if (applicationApply !== applyArguments) {
+          // Custom apply owns the original list's interpretation. Forward it
+          // unchanged rather than executing getters to invent callback facts.
+          const gap = recordIpcObservationGap(channel, "custom-apply");
+          try {
+            return applyFunction(
+              applicationApply,
+              this === wrapped ? listener : this,
+              methodArgs,
+            );
+          } catch (cause) {
+            if (gap !== null) {
+              gap.error = true;
+              gap.phase = "failed";
+            }
+            throw cause;
+          }
+        }
+        // Native Function.apply performs its own list conversion before the
+        // recording wrapper observes an actual invocation frame.
+        // Borrowing the exposed method keeps its dynamic receiver.
+        return applyFunction(applyArguments, this, methodArgs);
+      },
+    });
+    defineProperty(wrapped, "listener", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value: listener,
+    });
+    weakMapSet(hookListenerRemovalTargets, wrapped, listener);
+    return on.call(this, channel, wrapped);
+  };
+  // Native once owns firing, removal and callback dispatch. Node versions
+  // differ in whether they read callback.call/apply. Observe actual invocation
+  // through a private callable Proxy instead of copying either implementation.
+  if (typeof once === "function")
+    ipcMain.once = function patchedIpcMainOnce(channel, listener) {
+      if (
+        typeof listener !== "function" ||
+        this === null ||
+        (typeof this !== "object" && typeof this !== "function")
+      )
+        return once.call(this, channel, listener);
+      const target = this;
+      const metadata = lookupPropertyDescriptor(
+        nativeFunctionPrototype,
+        "listener",
+      );
+      const onMetadata = lookupPropertyDescriptor(target, "on");
+      if (
+        metadata === null ||
+        (metadata !== undefined && !hasOwnProperty(metadata, "value")) ||
+        onMetadata === null ||
+        (onMetadata !== undefined && !hasOwnProperty(onMetadata, "value"))
+      ) {
+        // Native wrapper creation can expose its callback through an inherited
+        // setter/Proxy, including one installed by an on getter. Pass the exact
+        // app callback; registrations in this synchronous scope stay unwrapped.
+        const previousScope = unobservedOnceScope;
+        const scope = { channel, gapRecorded: false };
+        let failed = true;
+        unobservedOnceScope = scope;
+        try {
+          const result = applyFunction(once, target, [channel, listener]);
+          failed = false;
+          return result;
+        } finally {
+          unobservedOnceScope = previousScope;
+          // An app decorator can register through an unhooked alias and then
+          // throw. Preserve a gap for either outcome, not proof of registration.
+          if (!scope.gapRecorded)
+            recordIpcObservationGap(channel, "once-metadata", failed);
+        }
+      }
+      const receiver = new ProxyConstructor(
+        { __proto__: null },
+        {
+          get: (_target, key) => {
+            const value = getProperty(target, key, target);
+            if (
+              (key !== "on" && key !== "removeListener") ||
+              typeof value !== "function"
+            )
+              return value;
+            return function forwardOnceOperation(...args) {
+              if (key === "on") {
+                const wrapped = args[1];
+                defineProperty(wrapped, "listener", {
+                  ...ownPropertyDescriptor(wrapped, "listener"),
+                  value: listener,
+                });
+                weakMapSet(hookListenerRemovalTargets, wrapped, wrapped);
+              }
+              return applyFunction(value, target, args);
+            };
+          },
+          set: (_target, key, value) => setProperty(target, key, value, target),
+        },
+      );
+      const callback = createObservedOnceCallback(
+        target,
+        channel,
+        listener,
+        receiver,
+      );
+      const result = applyFunction(once, receiver, [channel, callback]);
+      return result === receiver ? target : result;
+    };
+  if (typeof removeAllListeners !== "function") return;
+  const nativeRemoveListener = ipcMain.removeListener;
+  const nativeRawListeners = ipcMain.rawListeners;
+  const nativeOff = ipcMain.off;
+  const completionAvailable =
+    typeof nativeRemoveListener === "function" &&
+    typeof nativeRawListeners === "function";
+  // Observed forwarding, not end-state inference: removeListener is patched
+  // like the registration methods so an in-flight translated removal can
+  // prove what the application's decorator chain did. The patch is a pure
+  // pass-through for every direct call — unchanged arguments and receiver,
+  // no metadata reads — so direct removal semantics stay byte-identical to
+  // plain EventEmitter. Its only addition serves a translated removal in
+  // flight: when this call's receiver is the emitter that flight was
+  // created for and the listener argument equals the flight's translated
+  // target, the application forwarded the removal (a decorator that
+  // swallows never reaches the instance's removeListener), and the live
+  // list is walked — without executing application getters — for the last
+  // registration the forwarded native call can match: the argument itself,
+  // or an entry whose data `.listener` names it. Native removeListener
+  // always removes its last match, so finding one proves the forwarded
+  // call removes a registration and this request is already satisfied. An
+  // entry reached before that proof whose `.listener` is an accessor is
+  // not a proven miss: the application's own native call executes that
+  // getter, so its match outcome is unpredictable, and the hook favors
+  // keeping the registration over removing behind the application's back.
+  // The receiver check keeps a decorator from marking an unrelated
+  // emitter's call: a captured patched method applied to another emitter
+  // marks nothing and only runs that emitter's own native removal.
+  // Applications that dispatch around the instance's own properties — a
+  // removeListener or off captured before the hook loaded, or explicit
+  // EventEmitter.prototype.removeListener/off calls — bypass this marker
+  // by construction of JavaScript dispatch; patching the shared prototype
+  // would affect every emitter in the process, which this observation
+  // hook must not do. Those paths keep plain native behavior exactly as
+  // an unhooked emitter, the same trust boundary as the other patched
+  // methods: the hook loads through -r before application code.
+  const markForwardedRemoval = (receiver, channel, removalTarget) => {
+    let forwarded = false;
+    for (
+      let index = listenerRemovalFlights.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const flight = listenerRemovalFlights[index];
+      if (
+        flight.emitter === receiver &&
+        flight.channel === channel &&
+        flight.removalTarget === removalTarget
+      ) {
+        flight.forwarded = true;
+        forwarded = true;
+      }
+    }
+    if (!forwarded) return;
+    const registrations = nativeRawListeners.call(receiver, channel);
+    let satisfied = false;
+    for (let index = registrations.length - 1; index >= 0; index -= 1) {
+      const entry = registrations[index];
+      if (entry === removalTarget) {
+        satisfied = true;
+        break;
+      }
+      const descriptor = listenerDataDescriptor(entry);
+      // A null descriptor is accessor metadata or an opaque chain: the
+      // native call executes that getter during its own scan, so the
+      // entry's match is unpredictable rather than a proven miss. An
+      // undefined descriptor is a proven miss: no metadata to match.
+      if (descriptor === null) {
+        satisfied = true;
+        break;
+      }
+      if (descriptor !== undefined && descriptor.value === removalTarget) {
+        satisfied = true;
+        break;
+      }
+    }
+    if (!satisfied) return;
+    for (
+      let index = listenerRemovalFlights.length - 1;
+      index >= 0;
+      index -= 1
+    ) {
+      const flight = listenerRemovalFlights[index];
+      if (
+        flight.emitter === receiver &&
+        flight.channel === channel &&
+        flight.removalTarget === removalTarget
+      )
+        flight.satisfiedByNative = true;
+    }
+  };
+  if (completionAvailable) {
+    ipcMain.removeListener = function patchedIpcMainRemoveListener(...args) {
+      if (listenerRemovalFlights.length !== 0)
+        markForwardedRemoval(this, args[0], args[1]);
+      return applyFunction(nativeRemoveListener, this, args);
+    };
+    // Verified on Node 24: EventEmitter.prototype.off is the same function
+    // as EventEmitter.prototype.removeListener, and this.off(...) does not
+    // dispatch through the instance's own removeListener property. A
+    // decorator forwarding through off would therefore bypass the marker
+    // above, so off carries the identical pass-through and marker; its
+    // direct calls keep unchanged arguments and receiver through the
+    // captured native off.
+    if (typeof nativeOff === "function")
+      ipcMain.off = function patchedIpcMainOff(...args) {
+        if (listenerRemovalFlights.length !== 0)
+          markForwardedRemoval(this, args[0], args[1]);
+        return applyFunction(nativeOff, this, args);
+      };
+  }
+  // Node owns its live-array traversal. A forwarding receiver translates only
+  // our "on" entries before calling the current application removal method,
+  // including decorators installed/replaced during traversal. Application
+  // getters and methods always receive the real emitter; its public methods
+  // are never temporarily replaced. Native once entries remain unchanged.
+  // The registry stays authoritative when the application mutates or
+  // replaces the public `.listener` metadata: a translated removal that
+  // leaves the wrapper registered — mutated metadata defeats the
+  // application's own native match — is completed by wrapper identity
+  // through the native removal captured here, scoped to the removal it
+  // translates. Completion is observed through the patched
+  // ipcMain.removeListener/off above, never inferred from end state: a listener
+  // count or metadata observed after the decorator returns cannot show what
+  // the application's own call matched, because a decorator can remove
+  // another callback on the same channel during the flight, or forward
+  // while the metadata is mutated and restore it before returning. Public
+  // metadata is never temporarily restored, and the ordinary path does no
+  // listener-list work: no count is captured, and the only list reads are
+  // the patched method's forwarding check and the completion check below.
+  ipcMain.removeAllListeners = function patchedIpcMainRemoveAllListeners(
+    ...args
+  ) {
+    const emitter = this;
+    // A separate empty target also permits forwarding a non-writable app
+    // method; a Proxy of the emitter itself would violate get invariants.
+    const receiver = new ProxyConstructor(
+      { __proto__: null },
+      {
+        get(_target, key) {
+          const value = getProperty(emitter, key, emitter);
+          if (
+            (key !== "removeListener" && key !== "removeAllListeners") ||
+            typeof value !== "function"
+          )
+            return value;
+          return (...methodArgs) => {
+            if (key === "removeListener") {
+              const entry = methodArgs[1];
+              const removalTarget = weakMapGet(
+                hookListenerRemovalTargets,
+                entry,
+              );
+              // Translate by registry identity whenever the data link is a
+              // data property, whatever value mutation left on it. Accessor
+              // metadata stays untranslated: the application's own native
+              // removal owns when that getter executes, preserving plain
+              // EventEmitter parity for throwing accessors.
+              if (
+                removalTarget !== undefined &&
+                removalTarget !== entry &&
+                listenerDataDescriptor(entry) != null
+              ) {
+                const channel = methodArgs[0];
+                const flight = {
+                  channel,
+                  emitter,
+                  entry,
+                  forwarded: false,
+                  reregistered: false,
+                  removalTarget,
+                  satisfiedByNative: false,
+                };
+                arrayPush(listenerRemovalFlights, flight);
+                methodArgs[1] = removalTarget;
+                let result;
+                try {
+                  result = applyFunction(value, emitter, methodArgs);
+                } finally {
+                  arrayPop(listenerRemovalFlights);
+                }
+                // Complete only on observed forwarding: the patched
+                // ipcMain.removeListener/off proved the application's chain
+                // passed the translated target to a native removal on this
+                // emitter, and that call had no registration it provably
+                // could match — so this request removed nothing, and a
+                // matched or unpredictable sibling stands down, keeping one
+                // removal per request. A wrapper
+                // re-registered on this channel during the call is a
+                // deliberate restore. The wrapper still registered by
+                // identity on a re-read of the live list (shift-proof
+                // under prepends) completes the removal the application's
+                // own native match missed.
+                if (
+                  completionAvailable &&
+                  flight.forwarded &&
+                  !flight.satisfiedByNative &&
+                  !flight.reregistered &&
+                  arrayLastIndexOf(
+                    nativeRawListeners.call(emitter, channel),
+                    entry,
+                  ) >= 0
+                )
+                  nativeRemoveListener.call(emitter, channel, entry);
                 return result;
-              } catch (cause) {
-                if (recorded !== null) recorded.error = true;
-                throw cause;
               }
             }
-          : function wrappedEventListener(event, ...args) {
-              const recorded = recordInvocation(kind, channel, event, args);
-              try {
-                return listener.call(this, event, ...args);
-              } catch (cause) {
-                if (recorded !== null) recorded.error = true;
-                throw cause;
-              }
-            };
-      return original.call(this, channel, wrapped);
-    };
-  }
+            return applyFunction(value, emitter, methodArgs);
+          };
+        },
+        set: (_target, key, value) => setProperty(emitter, key, value, emitter),
+      },
+    );
+    const result = applyFunction(removeAllListeners, receiver, args);
+    return result === receiver ? emitter : result;
+  };
 };
 
 const patchNavigationMethods = (webContents, contentsId) => {
@@ -649,10 +1199,24 @@ try {
   );
 }
 
+// Never expose retained buffers to application iterators or array constructors.
+const snapshotArray = (values, project) =>
+  arrayFrom({ __proto__: null, length: values.length }, (_unused, index) =>
+    project === undefined ? values[index] : project(values[index]),
+  );
+
+const snapshotCounts = (counts, field) => {
+  const values = { __proto__: null, length: 0 };
+  forEachMapEntry(counts, (count, value) => {
+    values[values.length++] = { [field]: value, count };
+  });
+  return arrayFrom(values);
+};
+
 globalThis.__reaElectronActiveSnapshot = () => ({
-  events: events.map((event) => ({
+  events: snapshotArray(events, (event) => ({
     ...event,
-    argument_shapes: [...event.argument_shapes],
+    argument_shapes: snapshotArray(event.argument_shapes),
   })),
   retention_budget_bytes: retentionBudgetBytes,
   estimated_retained_bytes: estimatedRetainedBytes,
@@ -661,14 +1225,8 @@ globalThis.__reaElectronActiveSnapshot = () => ({
   dropped,
   dropped_ipc: droppedIpc,
   dropped_runtime: droppedRuntime,
-  dropped_event_families: [...droppedFamilies].map(([family, count]) => ({
-    family,
-    count,
-  })),
-  dropped_event_roles: [...droppedRoles].map(([role, count]) => ({
-    role,
-    count,
-  })),
+  dropped_event_families: snapshotCounts(droppedFamilies, "family"),
+  dropped_event_roles: snapshotCounts(droppedRoles, "role"),
   observed,
   observed_ipc: observedIpc,
   observed_runtime: observedRuntime,

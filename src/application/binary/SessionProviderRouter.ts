@@ -12,7 +12,6 @@ import type {
   CapabilityDescriptor,
   ProviderIdentity,
 } from "../AnalysisProvider.js";
-import type { FileCloseResourceOwner } from "../AnalysisProvider.js";
 import {
   AnalysisProviderRegistry,
   type AnalysisProviderBinding,
@@ -86,15 +85,8 @@ export class SessionProviderRouter {
     target: BinaryTarget,
     providerId?: AnalysisProviderSelector,
     signal?: AbortSignal,
-    fileCloseResources?: FileCloseResourceOwner,
   ): Promise<Result<SessionProviderRoute, AnalysisError>> {
-    const resolutionOptions =
-      signal === undefined && fileCloseResources === undefined
-        ? undefined
-        : {
-            ...(signal === undefined ? {} : { signal }),
-            ...(fileCloseResources === undefined ? {} : { fileCloseResources }),
-          };
+    const resolutionOptions = signal === undefined ? undefined : { signal };
     const selected = await this.registry.select(
       target,
       providerId,
@@ -106,10 +98,17 @@ export class SessionProviderRouter {
   }
 
   /** Candidate status authoritative for the active or target-free route. */
-  candidateStatuses(
+  async candidateStatuses(
     route: SessionProviderRoute,
-  ): readonly AnalysisProviderCandidateStatus[] {
-    return route.selection?.candidates ?? this.registry.candidates();
+    signal?: AbortSignal,
+  ): Promise<readonly AnalysisProviderCandidateStatus[]> {
+    return (
+      route.selection?.candidates ??
+      this.registry.candidates(
+        undefined,
+        signal === undefined ? {} : { signal },
+      )
+    );
   }
 
   /** Produce exact candidate rejections for an intentionally unbound route. */
